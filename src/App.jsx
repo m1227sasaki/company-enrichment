@@ -153,7 +153,6 @@ async function callWithSearch(prompt) {
   });
 
   // On 429, throw a specific error so the step skips cleanly
-  if (res1.status === 429) throw new Error("RATE_LIMIT");
   if (!res1.ok) throw new Error(`API_${res1.status}`);
   const data1 = await res1.json();
 
@@ -177,7 +176,6 @@ async function callWithSearch(prompt) {
       ],
     }),
   });
-  if (res2.status === 429) throw new Error("RATE_LIMIT");
   if (!res2.ok) throw new Error(`API_${res2.status}`);
   const data2 = await res2.json();
 
@@ -239,8 +237,7 @@ async function enrichCompany(company, onStepUpdate) {
       }
     }
   } catch (e) {
-    if (e.message === "RATE_LIMIT") onStepUpdate("⚠️ Step 1: Rate limited, skipping...");
-    else console.error("Step 1:", e);
+    console.error("Step 1:", e.message);
   }
   await delay(STEP_DELAY);
 
@@ -250,8 +247,7 @@ async function enrichCompany(company, onStepUpdate) {
     const url = await searchStep(`"${name}" company`, name, empHint, locationHint);
     if (url) results.push({ url, step: "Step 2" });
   } catch (e) {
-    if (e.message === "RATE_LIMIT") onStepUpdate("⚠️ Step 2: Rate limited, skipping...");
-    else console.error("Step 2:", e);
+    console.error("Step 2:", e.message);
   }
   await delay(STEP_DELAY);
 
@@ -265,8 +261,7 @@ async function enrichCompany(company, onStepUpdate) {
     );
     if (url) results.push({ url, step: "Step 3 (LinkedIn)" });
   } catch (e) {
-    if (e.message === "RATE_LIMIT") onStepUpdate("⚠️ Step 3: Rate limited, skipping...");
-    else console.error("Step 3:", e);
+    console.error("Step 3:", e.message);
   }
 
   // ── Cross-validate after Step 3 ──
@@ -297,8 +292,7 @@ async function enrichCompany(company, onStepUpdate) {
     );
     if (url) results.push({ url, step: "Step 5 (directory)" });
   } catch (e) {
-    if (e.message === "RATE_LIMIT") onStepUpdate("⚠️ Step 5: Rate limited, skipping...");
-    else console.error("Step 5:", e);
+    console.error("Step 5:", e.message);
   }
   await delay(STEP_DELAY);
 
@@ -313,8 +307,7 @@ async function enrichCompany(company, onStepUpdate) {
     );
     if (url) results.push({ url, step: "Step 6 (last resort)" });
   } catch (e) {
-    if (e.message === "RATE_LIMIT") onStepUpdate("⚠️ Step 6: Rate limited, skipping...");
-    else console.error("Step 6:", e);
+    console.error("Step 6:", e.message);
   }
 
   // ── Final decision ──
