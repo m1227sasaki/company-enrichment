@@ -1,7 +1,6 @@
 import { useState, useRef, useCallback } from "react";
 
 const CONCURRENCY = 3;
-const MAX_RETRIES = 1;
 
 function parseCSV(text) {
   const lines = text.replace(/\r/g, "").split("\n").filter(Boolean);
@@ -21,7 +20,6 @@ function parseCSV(text) {
       id: cols[2] || "",
       website: "",
       status: "pending",
-      retries: 0,
     };
   });
 }
@@ -35,54 +33,61 @@ function toCSV(companies) {
   return header + rows.join("\n");
 }
 
-async function searchCompanyWebsite(company, isRetry = false) {
-  const empHint = company.employees ? ` with approximately ${company.employees} employees` : "";
-
-  const prompt = isRetry
-    ? `You MUST use web search to find the official website for this company: "${company.name}"${empHint}.
-
-Search for "${company.name} official website" and "${company.name} company homepage".
-Try multiple search queries if needed.
-Look at the search results carefully - the website is very likely to exist.
-
-Return ONLY one of these:
-- The full URL like https://www.example.com
-- Not Available (only if after multiple searches you truly cannot find anything)
-- Too many similar results (only if multiple unrelated companies share this exact name)
-
-No explanation. Just the URL or one of the two phrases.`
-    : `You MUST perform a web search to find the official website URL for this company: "${company.name}"${empHint}.
-
-Instructions:
-1. Search the web for "${company.name} official website"
-2. Also try searching for "${company.name} company"
-3. Look through the search results for the company's homepage
-4. The company website almost certainly exists - look carefully before giving up
-
-Return ONLY one of these:
-- The full URL like https://www.example.com (most likely answer)
-- Not Available (ONLY if after thorough searching you find absolutely nothing)
-- Too many similar results (ONLY if multiple completely different companies share this exact name)
-
-Do not include any explanation. Just the URL or one of the two phrases.`;
-
+async function callAPI(messages) {
   const response = await fetch("/api/search", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       model: "claude-sonnet-4-20250514",
-      max_tokens: 300,
+      max_tokens: 500,
       tools: [{ type: "web_search_20250305", name: "web_search" }],
-      tool_choice: { type: "auto" },
-      system: "You are a company research assistant. You ALWAYS use web search before answering. Never say 'Not Available' without first performing at least two different web searches. Be persistent in finding company websites.",
-      messages: [{ role: "user", content: prompt }],
+      messages,
     }),
   });
-
   if (!response.ok) throw new Error(`API error ${response.status}`);
   const data = await response.json();
   const textBlock = data.content?.find((b) => b.type === "text");
-  return textBlock?.text?.trim() || "Not Available";
+  return textBlock?.text?.trim() || "";
+}
+
+async function enrichCompany(company) {
+  const empHint = company.employees ? ` (${company.employees} employees)` : "";
+
+  const prompt = `You are a research assistant. Your job is to find the official website for a company. Be thorough and persistent — try multiple search strategies before giving up.
+
+Company name: "${company.name}"${empHint}
+
+Follow these steps IN ORDER until you find the website:
+
+STEP 1: Search for "${company.name} official website"
+STEP 2: If not found, search for "${company.name} company site"
+STEP 3: If not found, search for "${company.name} LinkedIn" — check the LinkedIn company page, the website is usually listed there
+STEP 4: If the company name contains ".com" or looks like a domain (e.g. "Pawtas.com"), try that directly as the URL
+STEP 5: Try searching just the company name without any extra words
+
+After ALL these attempts, respond with ONLY:
+- The full URL (e.g. https://www.example.com) if you found it
+- "Too many similar results" ONLY if many completely unrelated companies share this exact name
+- "Not Available" ONLY as a last resort after all 5 steps failed
+
+IMPORTANT:
+- Do NOT return "Not Available" after just one search — try all steps first
+- LinkedIn profile URLs are NOT the answer — find the actual company website listed ON the LinkedIn page
+- Return the URL only, no explanation`;
+
+  const result = await callAPI([{ role: "user", content: prompt }]);
+
+  if (!result || result.length < 5) return "Not Available";
+  if (result.toLowerCase().includes("not available")) return "Not Available";
+  if (result.toLowerCase().includes("too many similar")) return "Too many similar results";
+  if (result.startsWith("http://") || result.startsWith("https://")) return result;
+
+  // Sometimes the model returns a domain without https — fix it
+  if (result.match(/^[a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9]\.[a-zA-Z]{2,}$/)) {
+    return `https://${result}`;
+  }
+
+  return "Not Available";
 }
 
 export default function App() {
@@ -105,17 +110,10 @@ export default function App() {
     reader.readAsText(file);
   };
 
-  const recalcStats = (list) => {
-    setStats({
-      found: list.filter((c) => c.status === "found").length,
-      notAvailable: list.filter((c) => c.status === "notAvailable").length,
-      tooMany: list.filter((c) => c.status === "tooMany").length,
-      total: list.length,
-    });
-  };
-
   const updateCompany = useCallback((id, website, status) => {
-    setCompanies((prev) => prev.map((c) => (c.id === id ? { ...c, website, status } : c)));
+    setCompanies((prev) =>
+      prev.map((c) => (c.id === id ? { ...c, website, status } : c))
+    );
     setStats((prev) => {
       const next = { ...prev };
       if (status === "found") next.found++;
@@ -125,73 +123,47 @@ export default function App() {
     });
   }, []);
 
-  const processCompanies = async (targets) => {
+  const runBatch = async (targets) => {
+    setRunning(true);
+    stopRef.current = false;
     let idx = 0;
     const processNext = async () => {
       while (idx < targets.length && !stopRef.current) {
         const company = targets[idx++];
-        const isRetry = company.retries > 0;
-
         setCompanies((prev) =>
           prev.map((c) => (c.id === company.id ? { ...c, status: "searching" } : c))
         );
-
         try {
-          const website = await searchCompanyWebsite(company, isRetry);
+          const website = await enrichCompany(company);
           const status =
             website === "Not Available" ? "notAvailable"
             : website === "Too many similar results" ? "tooMany"
             : "found";
-
-          if (status === "notAvailable" && company.retries < MAX_RETRIES) {
-            setCompanies((prev) =>
-              prev.map((c) =>
-                c.id === company.id ? { ...c, status: "pending", retries: c.retries + 1 } : c
-              )
-            );
-            targets.push({ ...company, retries: company.retries + 1 });
-          } else {
-            updateCompany(company.id, website, status);
-          }
+          updateCompany(company.id, website, status);
         } catch {
           updateCompany(company.id, "Not Available", "notAvailable");
         }
         await new Promise((r) => setTimeout(r, 400));
       }
     };
-
     const workers = Array.from({ length: CONCURRENCY }, () => processNext());
     await Promise.all(workers);
-  };
-
-  const runEnrichment = async () => {
-    if (!companies.length) return;
-    setRunning(true);
-    setDone(false);
-    stopRef.current = false;
-    const pending = companies.filter((c) => c.status === "pending");
-    await processCompanies(pending);
     setRunning(false);
     setDone(true);
   };
 
+  const runAll = () => {
+    setStats({ found: 0, notAvailable: 0, tooMany: 0, total: companies.length });
+    runBatch(companies.filter((c) => c.status === "pending"));
+  };
+
   const rerunNotAvailable = () => {
-    setCompanies((prev) => {
-      const next = prev.map((c) =>
-        c.status === "notAvailable" ? { ...c, status: "pending", retries: 0, website: "" } : c
-      );
-      recalcStats(next);
-      setTimeout(async () => {
-        setRunning(true);
-        setDone(false);
-        stopRef.current = false;
-        const targets = next.filter((c) => c.status === "pending");
-        await processCompanies(targets);
-        setRunning(false);
-        setDone(true);
-      }, 100);
-      return next;
-    });
+    const targets = companies.filter((c) => c.status === "notAvailable");
+    setCompanies((prev) =>
+      prev.map((c) => (c.status === "notAvailable" ? { ...c, status: "pending", website: "" } : c))
+    );
+    setStats((prev) => ({ ...prev, notAvailable: 0 }));
+    setTimeout(() => runBatch(targets), 100);
   };
 
   const stopEnrichment = () => { stopRef.current = true; };
@@ -221,10 +193,10 @@ export default function App() {
       <div style={{ marginBottom: 32 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
           <div style={{ width: 8, height: 8, borderRadius: "50%", background: "#22c55e", boxShadow: "0 0 8px #22c55e" }} />
-          <span style={{ fontSize: 11, color: "#64748b", letterSpacing: 3, textTransform: "uppercase" }}>Website Enrichment Engine v2</span>
+          <span style={{ fontSize: 11, color: "#64748b", letterSpacing: 3, textTransform: "uppercase" }}>Website Enrichment Engine v3</span>
         </div>
         <h1 style={{ fontSize: 28, fontWeight: 600, margin: 0, color: "#f1f5f9", letterSpacing: -0.5 }}>Company URL Finder</h1>
-        <p style={{ color: "#64748b", fontSize: 13, margin: "6px 0 0" }}>Upload CSV → AI searches each company → Download enriched results</p>
+        <p style={{ color: "#64748b", fontSize: 13, margin: "6px 0 0" }}>Upload CSV → AI searches each company (Google + LinkedIn) → Download enriched results</p>
       </div>
 
       <div style={{ display: "flex", gap: 12, marginBottom: 24, flexWrap: "wrap", alignItems: "center" }}>
@@ -233,15 +205,15 @@ export default function App() {
           {companies.length ? `✓ ${companies.length} companies loaded` : "📂 Upload CSV"}
         </label>
 
-        {companies.length > 0 && !running && companies.some((c) => c.status === "pending") && (
-          <button onClick={runEnrichment} style={{ background: "#3b82f6", border: "none", borderRadius: 6, padding: "10px 24px", color: "#fff", cursor: "pointer", fontSize: 13, fontFamily: "inherit", fontWeight: 600 }}>
+        {companies.length > 0 && !running && (
+          <button onClick={runAll} style={{ background: "#3b82f6", border: "none", borderRadius: 6, padding: "10px 24px", color: "#fff", cursor: "pointer", fontSize: 13, fontFamily: "inherit", fontWeight: 600 }}>
             ▶ Start Enrichment
           </button>
         )}
 
         {!running && notAvailableCount > 0 && (
-          <button onClick={rerunNotAvailable} style={{ background: "#7c3aed", border: "none", borderRadius: 6, padding: "10px 24px", color: "#fff", cursor: "pointer", fontSize: 13, fontFamily: "inherit", fontWeight: 600 }}>
-            🔁 Retry {notAvailableCount} Not Available
+          <button onClick={rerunNotAvailable} style={{ background: "#78350f", border: "1px solid #92400e", borderRadius: 6, padding: "10px 24px", color: "#fcd34d", cursor: "pointer", fontSize: 13, fontFamily: "inherit", fontWeight: 600 }}>
+            🔄 Retry {notAvailableCount} Not Available
           </button>
         )}
 
@@ -264,7 +236,7 @@ export default function App() {
             { label: "Total", value: companies.length, color: "#94a3b8" },
             { label: "Processed", value: processed, color: "#38bdf8" },
             { label: "Found", value: stats.found, color: "#22c55e" },
-            { label: "Not Available", value: stats.notAvailable, color: "#f97316" },
+            { label: "Not Available", value: notAvailableCount, color: "#f97316" },
             { label: "Too Many", value: stats.tooMany, color: "#a78bfa" },
           ].map((s) => (
             <div key={s.label} style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 8, padding: "12px 16px" }}>
@@ -289,21 +261,19 @@ export default function App() {
 
       {companies.length > 0 && (
         <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, overflow: "hidden" }}>
-          <div style={{ display: "grid", gridTemplateColumns: "40px 1fr 100px 220px 70px", padding: "10px 16px", borderBottom: "1px solid #1e293b", fontSize: 10, color: "#475569", letterSpacing: 2, textTransform: "uppercase" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "40px 1fr 100px 220px 60px", padding: "10px 16px", borderBottom: "1px solid #1e293b", fontSize: 10, color: "#475569", letterSpacing: 2, textTransform: "uppercase" }}>
             <span>#</span><span>Company Name</span><span>Employees</span><span>Website</span><span>Status</span>
           </div>
           <div style={{ maxHeight: 500, overflowY: "auto" }}>
             {companies.map((c, i) => (
-              <div key={c.id} style={{ display: "grid", gridTemplateColumns: "40px 1fr 100px 220px 70px", padding: "8px 16px", borderBottom: "1px solid #0a0f1e", fontSize: 12, alignItems: "center", background: c.status === "searching" ? "#0f2027" : "transparent", transition: "background 0.2s" }}>
+              <div key={c.id} style={{ display: "grid", gridTemplateColumns: "40px 1fr 100px 220px 60px", padding: "8px 16px", borderBottom: "1px solid #0d1424", fontSize: 12, alignItems: "center", background: c.status === "searching" ? "#0f2027" : "transparent", transition: "background 0.2s" }}>
                 <span style={{ color: "#334155" }}>{i + 1}</span>
                 <span style={{ color: "#cbd5e1", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.name}</span>
                 <span style={{ color: "#475569" }}>{c.employees || "—"}</span>
                 <span style={{ color: c.status === "found" ? "#22c55e" : c.status === "searching" ? "#38bdf8" : "#64748b", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 11 }}>
                   {c.status === "searching" ? "searching..." : c.website || "—"}
                 </span>
-                <span style={{ color: statusColor[c.status] || "#475569", textAlign: "center", fontSize: 11 }}>
-                  {c.retries > 0 && c.status !== "found" ? "retry" : statusLabel[c.status] || "·"}
-                </span>
+                <span style={{ color: statusColor[c.status] || "#475569", textAlign: "center" }}>{statusLabel[c.status] || "·"}</span>
               </div>
             ))}
           </div>
