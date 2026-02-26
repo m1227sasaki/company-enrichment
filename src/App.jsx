@@ -135,49 +135,56 @@ function getDomainFromURL(url) {
 }
 
 // ─── Core API Call (proper multi-turn for web search) ─────────────────────────
+async function fetchWithRetry(body, maxRetries = 5) {
+  let waitMs = 10000;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const res = await fetch("/api/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (res.status === 429) {
+      if (attempt === maxRetries) throw new Error("Rate limit after retries");
+      console.warn(`429 rate limit — waiting ${waitMs/1000}s (retry ${attempt + 1}/${maxRetries})`);
+      await delay(waitMs);
+      waitMs = Math.min(waitMs * 2, 60000);
+      continue;
+    }
+    if (!res.ok) throw new Error(`API ${res.status}`);
+    return res;
+  }
+}
+
 async function callWithSearch(prompt) {
   const tools = [{ type: "web_search_20250305", name: "web_search" }];
 
-  // Round 1: Claude decides to search and calls the tool
-  const res1 = await fetch("/api/search", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 1000,
-      tools,
-      messages: [{ role: "user", content: prompt }],
-    }),
+  // Round 1: Claude searches
+  const res1 = await fetchWithRetry({
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 1000,
+    tools,
+    messages: [{ role: "user", content: prompt }],
   });
-  if (!res1.ok) throw new Error(`API ${res1.status}`);
   const data1 = await res1.json();
 
-  // Collect any text from round 1
   const text1 = data1.content.filter(b => b.type === "text").map(b => b.text).join("\n");
-
-  // Check if web search tool was used
   const usedSearch = data1.content.some(b => b.type === "tool_use" && b.name === "web_search");
 
-  if (!usedSearch) {
-    // Claude answered without searching — still return what it said
-    return text1;
-  }
+  if (!usedSearch) return text1;
 
-  // Round 2: Send back the tool results so Claude can read them and answer
-  const res2 = await fetch("/api/search", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 500,
-      tools,
-      messages: [
-        { role: "user", content: prompt },
-        { role: "assistant", content: data1.content },
-      ],
-    }),
+  // Pause between round 1 and 2 to avoid rate limits
+  await delay(3000);
+
+  // Round 2: Claude reads results and answers
+  const res2 = await fetchWithRetry({
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 500,
+    tools,
+    messages: [
+      { role: "user", content: prompt },
+      { role: "assistant", content: data1.content },
+    ],
   });
-  if (!res2.ok) throw new Error(`API ${res2.status}`);
   const data2 = await res2.json();
 
   const text2 = data2.content.filter(b => b.type === "text").map(b => b.text).join("\n");
@@ -229,12 +236,14 @@ async function enrichCompany(company, onStepUpdate) {
     const url = await searchStep("Step 1", `${name} official website`, name, empHint, locationHint);
     if (url) { results.push({ url, step: "Step 1" }); }
   } catch (e) { console.error("Step 1 error:", e); }
-  await delay(400);
+  await delay(3000);
 
   // Early exit: if Step 1 found something with high similarity, trust it immediately
   if (results.length > 0 && nameSimilarity(name, results[0].url) >= 0.8) {
     return { url: results[0].url, step: results[0].step + " (high confidence)" };
   }
+
+  await delay(3000);
 
   // ── STEP 2: Google company name search ──
   onStepUpdate("🔍 Step 2/6: Google company name...");
@@ -242,7 +251,7 @@ async function enrichCompany(company, onStepUpdate) {
     const url = await searchStep("Step 2", `"${name}" company`, name, empHint, locationHint);
     if (url) { results.push({ url, step: "Step 2" }); }
   } catch (e) { console.error("Step 2 error:", e); }
-  await delay(400);
+  await delay(3000);
 
   // ── STEP 3: LinkedIn company page → extract website ──
   onStepUpdate("🔗 Step 3/6: LinkedIn company page...");
@@ -256,7 +265,7 @@ Return the URL from that Website field — NOT the LinkedIn URL itself.`
     );
     if (url) { results.push({ url, step: "Step 3 (LinkedIn)" }); }
   } catch (e) { console.error("Step 3 error:", e); }
-  await delay(400);
+  await delay(3000);
 
   // ── Cross-validate after 3 steps ──
   const domains = results.map(r => getDomainFromURL(r.url)).filter(Boolean);
@@ -275,7 +284,7 @@ Return the URL from that Website field — NOT the LinkedIn URL itself.`
     const guessed = `https://www.${domainMatch[1].toLowerCase()}`;
     return { url: guessed, step: "Step 4 (domain in name)" };
   }
-  await delay(200);
+  await delay(2000);
 
   // ── STEP 5: Business directories (Crunchbase, Owler, Bloomberg) ──
   onStepUpdate("📋 Step 5/6: Business directories...");
@@ -289,7 +298,7 @@ These pages list the company's official website. Find and return that website UR
     );
     if (url) { results.push({ url, step: "Step 5 (directory)" }); }
   } catch (e) { console.error("Step 5 error:", e); }
-  await delay(400);
+  await delay(3000);
 
   // ── STEP 6: Last resort — broader search with location/industry ──
   onStepUpdate("🎯 Step 6/6: Last resort search...");
@@ -401,7 +410,7 @@ export default function App() {
           console.error("Enrichment failed:", err);
           updateCompany(company.id, "Not Available", "notAvailable", "Error");
         }
-        await delay(500);
+        await delay(2000);
       }
     };
 
